@@ -1,0 +1,19 @@
+[package]
+name = "geen"
+version = "0.0.1"
+authors = ["hello@organism.ai"]
+description = "Hashed based Accumulators"
+license = "Apache-2.0"
+edition = "2018"
+
+[dependencies]
+mohan = "0.0.*"
+failure = "0.1"
+hashbrown = "0.6"
+serde = { version = "1.0", features = ["derive"] }
+croaring =  "0.4.0"
+
+
+[dev-dependencies]
+serde_json = "1.0"
+bincode = "1.1"
