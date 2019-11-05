@@ -5,7 +5,8 @@ use crate::{
     algos::{leaf_index, n_leaves},
     GeneError,
     MerkleMountainRange,
-    Bitmap
+    Bitmap,
+    MutableMmrLeafNodes
 };
 use mohan::hash::{
     BlakeHasher,
@@ -47,6 +48,14 @@ where
         }
     }
 
+    /// Reset the MutableMmr and restore the MMR state from the set of leaf_hashes and deleted nodes.
+    pub fn restore(&mut self, state: MutableMmrLeafNodes) -> Result<(), GeneError> {
+        self.mmr.restore(state.leaf_hashes)?;
+        self.deleted = state.deleted;
+        self.size = self.mmr.get_leaf_count()? as u32;
+        Ok(())
+    }
+
     /// Return the number of leaf nodes in the `MutableMmr` that have not been marked as deleted.
     ///
     /// NB: This is semantically different to `MerkleMountainRange::len()`. The latter returns the total number of
@@ -78,6 +87,11 @@ where
         let hash = self.mmr.get_node_hash(leaf_index(leaf_node_index as usize))?;
         let deleted = self.deleted.contains(leaf_node_index);
         Ok((hash, deleted))
+    }
+
+    /// Returns the number of leave nodes in the MMR.
+    pub fn get_leaf_count(&self) -> usize {
+        self.size as usize
     }
 
     /// Returns a merkle(ish) root for this merkle set.
@@ -175,6 +189,30 @@ where
         let bitmap_ser = self.deleted.serialize();
         hasher.write(&bitmap_ser);
         hasher.finalize()
+    }
+
+    // Returns a bitmap with only the deleted nodes for the specified region in the MMR.
+    fn get_sub_bitmap(&self, index: usize, count: usize) -> Result<Bitmap, GeneError> {
+        let mut deleted = self.deleted.clone();
+        if index > 0 {
+            deleted.remove_range_closed(0..(index - 1) as u32)
+        }
+        let leaf_count = self.mmr.get_leaf_count()?;
+        if leaf_count > 1 {
+            let last_index = index + count - 1;
+            if last_index < leaf_count - 1 {
+                deleted.remove_range_closed((last_index + 1) as u32..leaf_count as u32);
+            }
+        }
+        Ok(deleted)
+    }
+
+    /// Returns the state of the MMR that consists of the leaf hashes and the deleted nodes.
+    pub fn to_leaf_nodes(&self, index: usize, count: usize) -> Result<MutableMmrLeafNodes, GeneError> {
+        Ok(MutableMmrLeafNodes {
+            leaf_hashes: self.mmr.get_leaf_hashes(index, count)?,
+            deleted: self.get_sub_bitmap(index, count)?,
+        })
     }
 
     /// Expose the MerkleMountainRange for verifying proofs

@@ -6,10 +6,10 @@ use mohan::hash::{
 };
 use crate::{
     Storage,
-    algos::{ bintree_height, find_peaks, leaf_index, peak_map_height },
+    algos::{ bintree_height, find_peaks, leaf_index, peak_map_height, n_leaves },
     GeneError,
 };
-
+use std::cmp::max;
 
 /// An implementation of a Merkle Mountain Range (MMR). The MMR is append-only and immutable. Only the hashes are
 /// stored in this data structure. The data itself can be stored anywhere as long as you can maintain a 1:1 mapping
@@ -30,6 +30,17 @@ where
         MerkleMountainRange {
             hashes: backend
         }
+    }
+
+    /// Clears the MMR and restores its state from a set of leaf hashes.
+    pub fn restore(&mut self, leaf_hashes: Vec<H256>) -> Result<(), GeneError> {
+        self.hashes
+            .clear()
+            .map_err(|e| GeneError::BackendError(e.to_string()))?;
+        for hash in leaf_hashes {
+            self.push(&hash)?;
+        }
+        Ok(())
     }
 
     /// Return the number of nodes in the full Merkle Mountain range, excluding bagged hashes
@@ -55,6 +66,24 @@ where
     /// This function returns the hash of the leaf index provided, indexed from 0
     pub fn get_leaf_hash(&self, leaf_node_index: usize) -> Result<Option<H256>, GeneError> {
         self.get_node_hash(leaf_index(leaf_node_index))
+    }
+
+    /// Returns the number of leaf nodes in the MMR.
+    pub fn get_leaf_count(&self) -> Result<usize, GeneError> {
+        Ok(n_leaves(self.len()?))
+    }
+
+    /// Returns a set of leaf hashes from the MMR.
+    pub fn get_leaf_hashes(&self, index: usize, count: usize) -> Result<Vec<H256>, GeneError> {
+        let count = max(1, count);
+        let last_index = index + count - 1;
+        let mut leaf_hashes = Vec::with_capacity(count as usize);
+        for index in index..=last_index {
+            if let Some(hash) = self.get_leaf_hash(index)? {
+                leaf_hashes.push(hash);
+            }
+        }
+        Ok(leaf_hashes)
     }
 
     /// This function will return the single merkle root of the MMR by simply hashing the peaks together.

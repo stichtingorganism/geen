@@ -2,6 +2,7 @@
 
 use crate::GeneError;
 use failure;
+use std::cmp::min;
 
 /// A trait describing generic array-like behaviour, without imposing any specific details on how this is actually done.
 pub trait Storage {
@@ -20,6 +21,9 @@ pub trait Storage {
     /// Return the item at the given index. Use this if you *know* that the index is valid. Requesting a hash for an
     /// invalid index may cause the a panic
     fn get_or_panic(&self, index: usize) -> Self::Value;
+
+    /// Remove all stored items from the the backend.
+    fn clear(&mut self) -> Result<(), Self::Error>;
 }
 
 pub trait StorageExt {
@@ -27,6 +31,9 @@ pub trait StorageExt {
 
     /// Shortens the array, keeping the first len elements and dropping the rest.
     fn truncate(&mut self, _len: usize) -> Result<(), GeneError>;
+
+    /// Shift the array, by discarding the first n elements from the front.
+    fn shift(&mut self, n: usize) -> Result<(), GeneError>;
 
     /// Execute the given closure for each value in the array
     fn for_each<F>(&self, f: F) -> Result<(), GeneError>
@@ -53,6 +60,11 @@ impl<T: Clone> Storage for Vec<T> {
     fn get_or_panic(&self, index: usize) -> Self::Value {
         self[index].clone()
     }
+
+    fn clear(&mut self) -> Result<(), Self::Error> {
+        Vec::clear(self);
+        Ok(())
+    }
 }
 
 impl<T: Clone> StorageExt for Vec<T> {
@@ -60,6 +72,12 @@ impl<T: Clone> StorageExt for Vec<T> {
 
     fn truncate(&mut self, len: usize) -> Result<(), GeneError> {
         self.truncate(len);
+        Ok(())
+    }
+
+    fn shift(&mut self, n: usize) -> Result<(), GeneError> {
+        let drain_n = min(n, self.len());
+        self.drain(0..drain_n);
         Ok(())
     }
 

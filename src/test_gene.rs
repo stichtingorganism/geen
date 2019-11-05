@@ -15,7 +15,9 @@ use crate::{
     Bitmap,
     MutableMmr,
     pruned_mmr::prune_mmr,
-    MerkleChangeTracker
+    MerkleChangeTracker,
+    MerkleChangeTrackerConfig,
+    MerkleCheckPoint
 };
 
 
@@ -136,6 +138,78 @@ fn equality_check() {
 fn validate() {
     let mmr = create_mmr(65);
     assert!(mmr.validate().is_ok());
+}
+
+#[test]
+fn restore_from_leaf_hashes() {
+    let mut mmr = MerkleMountainRange::<_>::new(Vec::default());
+    let leaf_hashes = mmr.get_leaf_hashes(0, 1).unwrap();
+    assert_eq!(leaf_hashes.len(), 0);
+
+    let h0 = int_to_hash(0);
+    let h1 = int_to_hash(1);
+    let h2 = int_to_hash(2);
+    let h3 = int_to_hash(3);
+    assert!(mmr.push(&h0).is_ok());
+    assert!(mmr.push(&h1).is_ok());
+    assert!(mmr.push(&h2).is_ok());
+    assert!(mmr.push(&h3).is_ok());
+    assert_eq!(mmr.len(), Ok(7));
+
+    // Construct MMR state from multiple leaf hash queries.
+    let leaf_count = mmr.get_leaf_count().unwrap();
+    let mut leaf_hashes = mmr.get_leaf_hashes(0, 2).unwrap();
+    leaf_hashes.append(&mut mmr.get_leaf_hashes(2, leaf_count - 2).unwrap());
+    assert_eq!(leaf_hashes.len(), 4);
+    assert_eq!(leaf_hashes[0], h0);
+    assert_eq!(leaf_hashes[1], h1);
+    assert_eq!(leaf_hashes[2], h2);
+    assert_eq!(leaf_hashes[3], h3);
+
+    assert!(mmr.push(&int_to_hash(4)).is_ok());
+    assert!(mmr.push(&int_to_hash(5)).is_ok());
+    assert_eq!(mmr.len(), Ok(10));
+
+    assert!(mmr.restore(leaf_hashes).is_ok());
+    assert_eq!(mmr.len(), Ok(7));
+    assert_eq!(mmr.get_leaf_hash(0), Ok(Some(h0)));
+    assert_eq!(mmr.get_leaf_hash(1), Ok(Some(h1)));
+    assert_eq!(mmr.get_leaf_hash(2), Ok(Some(h2)));
+    assert_eq!(mmr.get_leaf_hash(3), Ok(Some(h3)));
+    assert_eq!(mmr.get_leaf_hash(4), Ok(None));
+}
+
+#[test]
+fn restore_from_leaf_nodes() {
+    let mut mmr = MutableMmr::<_>::new(Vec::default());
+    for i in 0..12 {
+        assert!(mmr.push(&int_to_hash(i)).is_ok());
+    }
+    assert!(mmr.delete_and_compress(2, true));
+    assert!(mmr.delete_and_compress(4, true));
+    assert!(mmr.delete_and_compress(5, true));
+
+    // Request state of MMR with single call
+    let leaf_count = mmr.get_leaf_count();
+    let mmr_state1 = mmr.to_leaf_nodes(0, leaf_count).unwrap();
+
+    // Request state of MMR with multiple calls
+    let mut mmr_state2 = mmr.to_leaf_nodes(0, 3).unwrap();
+    mmr_state2.combine(mmr.to_leaf_nodes(3, 3).unwrap());
+    mmr_state2.combine(mmr.to_leaf_nodes(6, leaf_count - 6).unwrap());
+    assert_eq!(mmr_state1, mmr_state2);
+
+    // Change the state more before the restore
+    let mmr_root = mmr.get_merkle_root();
+    assert!(mmr.push(&int_to_hash(7)).is_ok());
+    assert!(mmr.push(&int_to_hash(8)).is_ok());
+    assert!(mmr.delete_and_compress(3, true));
+
+    // Restore from compact state
+    assert!(mmr.restore(mmr_state1.clone()).is_ok());
+    assert_eq!(mmr.get_merkle_root(), mmr_root);
+    let restored_mmr_state = mmr.to_leaf_nodes(0, mmr.get_leaf_count()).unwrap();
+    assert_eq!(restored_mmr_state, mmr_state2);
 }
 
 //
@@ -362,7 +436,12 @@ fn pruned_mmrs() {
 #[test]
 fn change_tracker() {
     let mmr = MutableMmr::<_>::new(Vec::default());
-    let mmr = MerkleChangeTracker::new(mmr, Vec::new()).unwrap();
+    let config = MerkleChangeTrackerConfig {
+        min_history_len: 15,
+        max_history_len: 20,
+    };
+
+    let mmr = MerkleChangeTracker::new(mmr, Vec::new(), config).unwrap();
     assert_eq!(mmr.checkpoint_count(), Ok(0));
     assert_eq!(mmr.is_empty(), Ok(true));
 }
@@ -372,7 +451,11 @@ fn change_tracker() {
 fn checkpoints() {
     //----------- Construct and populate the initial MMR --------------------------
     let base = MutableMmr::<_>::new(Vec::default());
-    let mut mmr = MerkleChangeTracker::new(base, Vec::new()).unwrap();
+    let config = MerkleChangeTrackerConfig {
+        min_history_len: 15,
+        max_history_len: 20,
+    };
+    let mut mmr = MerkleChangeTracker::new(base, Vec::new(), config).unwrap();
     for i in 0..5 {
         assert!(mmr.push(&int_to_hash(i)).is_ok());
     }
@@ -432,7 +515,11 @@ fn checkpoints() {
 fn reset_and_replay() {
     // You don't have to use a Pruned MMR... any MMR implementation is fine
     let base = MutableMmr::from(create_mmr(5));
-    let mut mmr = MerkleChangeTracker::new(base, Vec::new()).unwrap();
+    let config = MerkleChangeTrackerConfig {
+        min_history_len: 15,
+        max_history_len: 20,
+    };
+    let mut mmr = MerkleChangeTracker::new(base, Vec::new(), config).unwrap();
     let root = mmr.get_merkle_root();
     // Add some new nodes etc
     assert!(mmr.push(&int_to_hash(10)).is_ok());
@@ -480,4 +567,51 @@ fn reset_and_replay() {
     assert_eq!(mmr.len(), 3);
 
     assert_eq!(mmr.get_merkle_root(), root);
+}
+
+
+#[test]
+fn serialize_and_deserialize_merklecheckpoint() {
+    let nodes_added = vec![int_to_hash(0), int_to_hash(1)];
+    let mut nodes_deleted = Bitmap::create();
+    nodes_deleted.add(1);
+    nodes_deleted.add(5);
+    let mcp = MerkleCheckPoint::new(nodes_added, nodes_deleted);
+
+    let ser_buf = bincode::serialize(&mcp).unwrap();
+    let des_mcp: MerkleCheckPoint = bincode::deserialize(&ser_buf).unwrap();
+    assert_eq!(mcp.into_parts(), des_mcp.into_parts());
+}
+
+#[test]
+fn update_of_base_mmr_with_history_bounds() {
+    let base = MutableMmr::<_>::new(Vec::default());
+    let config = MerkleChangeTrackerConfig {
+        min_history_len: 3,
+        max_history_len: 5,
+    };
+    let mut mmr = MerkleChangeTracker::new(base, Vec::new(), config).unwrap();
+    for i in 1..=5 {
+        assert!(mmr.push(&int_to_hash(i)).is_ok());
+        assert!(mmr.commit().is_ok());
+    }
+    let mmr_state = mmr.to_base_leaf_nodes(0, mmr.get_leaf_count()).unwrap();
+    assert_eq!(mmr_state.leaf_hashes.len(), 0);
+
+    assert!(mmr.push(&int_to_hash(6)).is_ok());
+    assert!(mmr.commit().is_ok());
+    let mmr_state = mmr.to_base_leaf_nodes(0, mmr.get_leaf_count()).unwrap();
+    assert_eq!(mmr_state.leaf_hashes.len(), 3);
+
+    for i in 7..=8 {
+        assert!(mmr.push(&int_to_hash(i)).is_ok());
+        assert!(mmr.commit().is_ok());
+    }
+    let mmr_state = mmr.to_base_leaf_nodes(0, mmr.get_leaf_count()).unwrap();
+    assert_eq!(mmr_state.leaf_hashes.len(), 3);
+
+    assert!(mmr.push(&int_to_hash(9)).is_ok());
+    assert!(mmr.commit().is_ok());
+    let mmr_state = mmr.to_base_leaf_nodes(0, mmr.get_leaf_count()).unwrap();
+    assert_eq!(mmr_state.leaf_hashes.len(), 6);
 }

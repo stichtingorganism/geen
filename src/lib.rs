@@ -190,6 +190,10 @@ pub enum GeneError {
     /// A request was out of range
     #[fail(display = "A request was out of range")]
     OutOfRange,
+
+    /// Conflicting or invalid configuration parameters provided.
+    #[fail(display = "Invalid configuration parameters ")]
+    InvalidConfig,
 }
 
 
@@ -220,8 +224,13 @@ pub mod pruned_mmr;
 mod change_tracker;
 pub use change_tracker::{ 
     MerkleChangeTracker, 
-    MerkleCheckPoint 
+    MerkleCheckPoint,
+    MerkleChangeTrackerConfig
 };
+
+mod mutable_mmr_leaf_nodes;
+/// A data structure for storing all the data required to restore the state of an MMR.
+pub use mutable_mmr_leaf_nodes::MutableMmrLeafNodes;
 
 // /// Dynamic Accumulator
 // mod pollard;
@@ -229,3 +238,16 @@ pub use change_tracker::{
 
 #[cfg(test)]
 mod test_gene;
+
+
+// /// Generic trait to ensure PMMR elements can be hashed with an index
+// pub trait PMMRIndexHashable {
+// 	/// Hash with a given index
+// 	fn hash_with_index(&self, index: u64) -> Hash;
+// }
+
+// impl<T: DefaultHashable> PMMRIndexHashable for T {
+// 	fn hash_with_index(&self, index: u64) -> Hash {
+// 		(index, self).hash()
+// 	}
+// }

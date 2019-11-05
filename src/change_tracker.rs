@@ -1,7 +1,7 @@
 //! Track Changes to a MMR, allows for rollback 
 
 
-use std::{mem, ops::Deref};
+use std::{mem, ops::Deref, fmt};
 use crate::{
     Storage,
     StorageExt,
@@ -9,11 +9,27 @@ use crate::{
     GeneError,
     pruned_mmr::{prune_mutable_mmr, PrunedMutableMmr},
     MutableMmr,
-    Bitmap
+    Bitmap,
+    MutableMmrLeafNodes
 };
 use mohan::hash::{
     H256
 };
+use serde::{
+    de::{self, Deserialize, Deserializer, MapAccess, SeqAccess, Visitor},
+    ser::{Serialize, SerializeStruct, Serializer},
+};
+
+/// Configuration for the MerkleChangeTracker.
+#[derive(Debug, Clone, Copy)]
+pub struct MerkleChangeTrackerConfig {
+    /// When the max_history_len is reached then the number of checkpoints upto the min_history_len is committed to the
+    /// base MMR.
+    pub min_history_len: usize,
+    /// The max_history_len specifies the point in history upto where the MMR can be rewinded.
+    pub max_history_len: usize,
+}
+
 
 /// A struct that wraps an MMR to keep track of changes to the MMR over time. This enables one to roll
 /// back changes to a point in history. Think of `MerkleChangeTracker` as 'git' for MMRs.
@@ -45,6 +61,9 @@ where
     current_additions: Vec<H256>,
     // The deletions since the last commit
     current_deletions: Bitmap,
+    config: MerkleChangeTrackerConfig,
+    // history transient length
+    hist_commit_count: usize,
 }
 
 
@@ -66,8 +85,14 @@ where
     pub fn new(
         base: MutableMmr<BaseBackend>,
         diffs: CpBackend,
+        config: MerkleChangeTrackerConfig,
     ) -> Result<MerkleChangeTracker<BaseBackend, CpBackend>, GeneError>
     {
+        if config.max_history_len < config.min_history_len {
+            return Err(GeneError::InvalidConfig);
+        }
+        let hist_commit_count = config.max_history_len - config.min_history_len + 1;
+
         let mmr = prune_mutable_mmr::<_>(&base)?;
         Ok(MerkleChangeTracker {
             base,
@@ -75,7 +100,18 @@ where
             checkpoints: diffs,
             current_additions: Vec::new(),
             current_deletions: Bitmap::create(),
+            config,
+            hist_commit_count,
         })
+    }
+
+    /// Reset the MerkleChangeTracker and restore the base MMR state.
+    pub fn restore(&mut self, base_state: MutableMmrLeafNodes) -> Result<(), GeneError> {
+        self.checkpoints
+            .clear()
+            .map_err(|e| GeneError::BackendError(e.to_string()))?;
+        self.rewind_to_start()?;
+        self.base.restore(base_state)
     }
 
     /// Return the number of Checkpoints this change tracker has recorded
@@ -119,8 +155,27 @@ where
         self.mmr.compress()
     }
 
+    /// Check if the the number of checkpoints have exceeded the maximum configured history length. If it does then the
+    /// oldest checkpoints are applied to the base mmr.
+    fn update_base_mmr(&mut self) -> Result<(), GeneError> {
+        if self.checkpoint_count()? > self.config.max_history_len {
+            for cp_index in 0..self.hist_commit_count {
+                if let Some(cp) = self
+                    .checkpoints
+                    .get(cp_index)
+                    .map_err(|e| GeneError::BackendError(e.to_string()))?
+                {
+                    cp.apply(&mut self.base)?;
+                }
+            }
+            self.checkpoints.shift(self.hist_commit_count)?;
+        }
+        Ok(())
+    }
+
+
     /// Commit the change history since the last commit to a new [MerkleCheckPoint] and clear the current change set.
-    pub fn commit(&mut self) -> Result<(), CpBackend::Error> {
+    pub fn commit(&mut self) -> Result<(), GeneError> {
         let mut hash_set = Vec::new();
         mem::swap(&mut hash_set, &mut self.current_additions);
 
@@ -128,9 +183,11 @@ where
         mem::swap(&mut deleted_set, &mut self.current_deletions);
 
         let diff = MerkleCheckPoint::new(hash_set, deleted_set);
-        self.checkpoints.push(diff)?;
+        self.checkpoints
+            .push(diff)
+            .map_err(|e| GeneError::BackendError(e.to_string()))?;
 
-        Ok(())
+        self.update_base_mmr()
     }
 
     /// Rewind the MMR state by the given number of Checkpoints.
@@ -214,6 +271,16 @@ where
             Some(cp) => Ok(cp.clone()),
         }
     }
+
+    /// Returns the MMR state of the base MMR.
+    pub fn to_base_leaf_nodes(
+        &self,
+        index: usize,
+        count: usize,
+    ) -> Result<MutableMmrLeafNodes, GeneError>
+    {
+        self.base.to_leaf_nodes(index, count)
+    }
 }
 
 impl<BaseBackend, DiffBackend> Deref for MerkleChangeTracker<BaseBackend, DiffBackend>
@@ -272,3 +339,96 @@ impl MerkleCheckPoint {
     }
 }
 
+impl Serialize for MerkleCheckPoint {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where S: Serializer {
+        let mut state = serializer.serialize_struct("MerkleCheckPoint", 2)?;
+        state.serialize_field("nodes_added", &self.nodes_added)?;
+        state.serialize_field("nodes_deleted", &self.nodes_deleted.serialize())?;
+        state.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for MerkleCheckPoint {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where D: Deserializer<'de> {
+        enum Field {
+            NodesAdded,
+            NodesDeleted,
+        };
+
+        impl<'de> Deserialize<'de> for Field {
+            fn deserialize<D>(deserializer: D) -> Result<Field, D::Error>
+            where D: Deserializer<'de> {
+                struct FieldVisitor;
+
+                impl<'de> Visitor<'de> for FieldVisitor {
+                    type Value = Field;
+
+                    fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+                        formatter.write_str("`nodes_added` or `nodes_deleted`")
+                    }
+
+                    fn visit_str<E>(self, value: &str) -> Result<Field, E>
+                    where E: de::Error {
+                        match value {
+                            "nodes_added" => Ok(Field::NodesAdded),
+                            "nodes_deleted" => Ok(Field::NodesDeleted),
+                            _ => Err(de::Error::unknown_field(value, FIELDS)),
+                        }
+                    }
+                }
+
+                deserializer.deserialize_identifier(FieldVisitor)
+            }
+        }
+
+        struct MerkleCheckPointVisitor;
+
+        impl<'de> Visitor<'de> for MerkleCheckPointVisitor {
+            type Value = MerkleCheckPoint;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+                formatter.write_str("struct MerkleCheckPoint")
+            }
+
+            fn visit_seq<V>(self, mut seq: V) -> Result<MerkleCheckPoint, V::Error>
+            where V: SeqAccess<'de> {
+                let nodes_added = seq.next_element()?.ok_or_else(|| de::Error::invalid_length(0, &self))?;
+                let nodes_deleted_buf: Vec<u8> =
+                    seq.next_element()?.ok_or_else(|| de::Error::invalid_length(1, &self))?;
+                let nodes_deleted: Bitmap = Bitmap::deserialize(&nodes_deleted_buf);
+                Ok(MerkleCheckPoint::new(nodes_added, nodes_deleted))
+            }
+
+            fn visit_map<V>(self, mut map: V) -> Result<MerkleCheckPoint, V::Error>
+            where V: MapAccess<'de> {
+                let mut nodes_added = None;
+                let mut nodes_deleted = None;
+                while let Some(key) = map.next_key()? {
+                    match key {
+                        Field::NodesAdded => {
+                            if nodes_added.is_some() {
+                                return Err(de::Error::duplicate_field("nodes_added"));
+                            }
+                            nodes_added = Some(map.next_value()?);
+                        },
+                        Field::NodesDeleted => {
+                            if nodes_deleted.is_some() {
+                                return Err(de::Error::duplicate_field("nodes_deleted"));
+                            }
+                            let nodes_deleted_buf: Vec<u8> = map.next_value()?;
+                            nodes_deleted = Some(Bitmap::deserialize(&nodes_deleted_buf));
+                        },
+                    }
+                }
+                let nodes_added = nodes_added.ok_or_else(|| de::Error::missing_field("nodes_added"))?;
+                let nodes_deleted = nodes_deleted.ok_or_else(|| de::Error::missing_field("nodes_deleted"))?;
+                Ok(MerkleCheckPoint::new(nodes_added, nodes_deleted))
+            }
+        }
+
+        const FIELDS: &[&str] = &["nodes_added", "nodes_deleted"];
+        deserializer.deserialize_struct("MerkleCheckPoint", FIELDS, MerkleCheckPointVisitor)
+    }
+}
