@@ -9,7 +9,10 @@ use crate::{
     algos::{ bintree_height, find_peaks, leaf_index, peak_map_height, n_leaves },
     GeneError,
 };
-use std::cmp::max;
+use std::cmp::{
+    max,
+    min
+};
 
 /// An implementation of a Merkle Mountain Range (MMR). The MMR is append-only and immutable. Only the hashes are
 /// stored in this data structure. The data itself can be stored anywhere as long as you can maintain a 1:1 mapping
@@ -75,9 +78,13 @@ where
 
     /// Returns a set of leaf hashes from the MMR.
     pub fn get_leaf_hashes(&self, index: usize, count: usize) -> Result<Vec<H256>, GeneError> {
+        let leaf_count = self.get_leaf_count()?;
+        if index >= leaf_count {
+            return Ok(Vec::new());
+        }
         let count = max(1, count);
-        let last_index = index + count - 1;
-        let mut leaf_hashes = Vec::with_capacity(count as usize);
+        let last_index = min(index + count - 1, leaf_count);
+        let mut leaf_hashes = Vec::with_capacity((last_index - index + 1) as usize);
         for index in index..=last_index {
             if let Some(hash) = self.get_leaf_hash(index)? {
                 leaf_hashes.push(hash);
