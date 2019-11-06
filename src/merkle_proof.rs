@@ -4,7 +4,9 @@ use mohan::{
     hash::{
         H256,
         BlakeHasher,
-    }
+    },
+    ser,
+    VarInt
 };
 use std::fmt::{self, Display, Formatter};
 use serde::{Deserialize, Serialize};
@@ -245,5 +247,48 @@ impl Display for MerkleProof {
             .enumerate()
             .fold(Ok(()), |_, (i, h)| f.write_str(&format!("{:3}: {}\n", i, h.to_hex())))?;
         Ok(())
+    }
+}
+
+
+impl ser::Writeable for MerkleProof {
+    fn write<W: ser::Writer>(&self, writer: &mut W) -> Result<(), ser::Error> {
+        writer.write_u64(self.mmr_size as u64)?;
+        let path_len = VarInt(self.path.len() as u64);
+        path_len.write(writer);
+
+        for i in 0..self.path.len() {
+            self.path[i].write(writer);
+        }
+
+        let peaks_len = VarInt(self.peaks.len() as u64);
+        peaks_len.write(writer);
+
+        for i in 0..self.peaks.len() {
+            self.peaks[i].write(writer);
+        }
+
+        Ok(())
+    }
+}
+
+impl ser::Readable for MerkleProof {
+    fn read(reader: &mut dyn ser::Reader) -> Result<MerkleProof, ser::Error> {
+        let mmr_size = reader.read_u64()? as usize;
+        let path_len = VarInt::read(reader)?;
+        let mut path = Vec::new();
+        for i in 0..path_len.as_u64() {
+            let hash = H256::read(reader)?;
+            path.push(hash);
+        }
+
+        let peaks_len = VarInt::read(reader)?;
+        let mut peaks = Vec::new();
+        for i in 0..peaks_len.as_u64() {
+            let hash = H256::read(reader)?;
+            peaks.push(hash);
+        }
+
+        Ok(MerkleProof { mmr_size, path, peaks })
     }
 }

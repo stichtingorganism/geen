@@ -1,6 +1,6 @@
 [package]
 name = "geen"
-version = "0.0.4"
+version = "0.0.5"
 authors = ["hello@organism.org"]
 description = "Hashed based Accumulators"
 license = "Apache-2.0"
