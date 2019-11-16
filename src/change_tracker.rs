@@ -19,6 +19,7 @@ use serde::{
     de::{self, Deserialize, Deserializer, MapAccess, SeqAccess, Visitor},
     ser::{Serialize, SerializeStruct, Serializer},
 };
+use anyhow::Result;
 
 /// Configuration for the MerkleChangeTracker.
 #[derive(Debug, Clone, Copy)]

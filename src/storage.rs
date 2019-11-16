@@ -1,13 +1,12 @@
 //! Storage Backend
 
 use crate::GeneError;
-use failure;
 use std::cmp::min;
 
 /// A trait describing generic array-like behaviour, without imposing any specific details on how this is actually done.
 pub trait Storage {
     type Value;
-    type Error: failure::Fail;
+    type Error: std::error::Error;
 
     /// Returns the number of hashes stored in the backend
     fn len(&self) -> Result<usize, Self::Error>;

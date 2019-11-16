@@ -137,62 +137,62 @@ pub type Bitmap = croaring::Bitmap;
 // pub type Bitmap = croaring::TreeMap;
 
 
-use failure::Fail;
+use thiserror::Error;
 
 /// Represents an error in proof creation, verification, or parsing.
-#[derive(Fail, Clone, Debug, Eq, PartialEq)]
+#[derive(Error, Clone, Debug, Eq, PartialEq)]
 pub enum GeneError {
     /// This error occurs when we receive a proof that's outdated and cannot be auto-updated.
-    #[fail(display = "Item proof is outdated and must be re-created against the new state")]
+    #[error("Item proof is outdated and must be re-created against the new state")]
     OutdatedProof,
 
     /// This error occurs when the merkle proof is too short or too long, or does not lead to a node
     /// to which it should.
-    #[fail(display = "Merkle proof is invalid")]
+    #[error("Merkle proof is invalid")]
     InvalidProof,
 
     /// Merkle proof root hash does not match when attempting to verify.
-    #[fail(display = "Merkle proof is invalid")]
+    #[error("Merkle proof is invalid")]
     RootMismatch,
 
     /// You tried to construct or verify a Merkle proof using a non-leaf node as the inclusion candidate
-    #[fail(display = "Merkle proof is invalid")]
+    #[error("Merkle proof is invalid")]
     NonLeafNode,
 
     /// There was no hash in the merkle tree backend with the given position
-    #[fail(display = "Merkle proof is invalid")]
+    #[error("Merkle proof is invalid")]
     HashNotFound(usize),
 
     /// The list of peak hashes provided in the proof has an error
-    #[fail(display = "Merkle proof is invalid")]
+    #[error("Merkle proof is invalid")]
     IncorrectPeakMap,
 
     /// Unexpected
-    #[fail(display = "Merkle proof is invalid")]
+    #[error("Merkle proof is invalid")]
     Unexpected,
 
     /// A problem has been encountered with the backend
-    #[fail(display = "Backend Error: {}", _0)]
+    #[error("Backend Error: {}", _0)]
     BackendError(String),
 
     /// The Merkle tree is not internally consistent. A parent hash isn't equal to the hash of its children
-    #[fail(display = "Merkle is not internally consistent")]
+    #[error("Merkle is not internally consistent")]
     InvalidMerkleTree,
 
     /// The next position was not a leaf node as expected
-    #[fail(display = "Merkle Tree Malformed")]
+    #[error("Merkle Tree Malformed")]
     CorruptDataStructure,
 
     /// The tree has reached its maximum size
-    #[fail(display = "Tree has reached its maximum size")]
+    #[error("Tree has reached its maximum size")]
     MaximumSizeReached,
 
     /// A request was out of range
-    #[fail(display = "A request was out of range")]
+    #[error("A request was out of range")]
     OutOfRange,
 
     /// Conflicting or invalid configuration parameters provided.
-    #[fail(display = "Invalid configuration parameters ")]
+    #[error("Invalid configuration parameters ")]
     InvalidConfig,
 }
 
