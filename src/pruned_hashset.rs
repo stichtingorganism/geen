@@ -67,6 +67,10 @@ impl Storage for PrunedHashSet {
         Ok(self.base_offset + self.hashes.len())
     }
 
+    fn is_empty(&self) -> Result<bool, Self::Error> {
+        Ok(self.len()? == 0)
+    }
+
     fn push(&mut self, item: Self::Value) -> Result<usize, Self::Error> {
         self.hashes.push(item);
         Ok(self.len()? - 1)

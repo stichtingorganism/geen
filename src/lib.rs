@@ -1,4 +1,4 @@
-// Copyright 2019 Stichting Organism
+// Copyright 2020 Stichting Organism
 // Copyright 2019 The Grin Developers
 // Copyright 2019 The Tari Project
 //
@@ -232,8 +232,11 @@ mod mutable_mmr_leaf_nodes;
 /// A data structure for storing all the data required to restore the state of an MMR.
 pub use mutable_mmr_leaf_nodes::MutableMmrLeafNodes;
 
-// /// Dynamic Accumulator
-// mod pollard;
+
+/// MemBackendVec is a shareable, memory only, vector that can be be used with MmrCache to store checkpoints.
+mod mem_backend_vec;
+pub use mem_backend_vec::MemBackendVec;
+
 
 
 #[cfg(test)]

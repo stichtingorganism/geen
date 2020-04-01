@@ -113,9 +113,14 @@ where
         self.mmr.get_merkle_root()
     }
 
-    /// See [MerkleMountainRange::find_merkle_root]
-    pub fn find_leaf_node(&self, hash: &H256) -> Result<Option<usize>, GeneError> {
-        self.mmr.find_leaf_node(hash)
+    /// See [MerkleMountainRange::find_node_index]
+    pub fn find_node_index(&self, hash: &H256) -> Result<Option<usize>, GeneError> {
+        self.mmr.find_node_index(hash)
+    }
+
+     /// See [MerkleMountainRange::find_leaf_index]
+     pub fn find_leaf_index(&self, hash: &H256) -> Result<Option<usize>, GeneError> {
+        self.mmr.find_leaf_index(hash)
     }
 
     /// Push a new element into the MMR. Computes new related peaks at the same time if applicable.
@@ -219,6 +224,18 @@ where
     pub fn mmr(&self) -> &MerkleMountainRange<B> {
         &self.mmr
     }
+
+    /// Return a reference to the bitmap of deleted nodes
+    pub fn deleted(&self) -> &Bitmap {
+        &self.deleted
+    }
+
+    pub fn clear(&mut self) -> Result<(), GeneError> {
+        self.mmr.clear()?;
+        self.deleted = Bitmap::create();
+        self.size = 0;
+        Ok(())
+    }
 }
 
 impl<B, B2> PartialEq<MutableMmr<B2>> for MutableMmr<B>
@@ -227,7 +244,7 @@ where
     B2: Storage<Value = H256>,
 {
     fn eq(&self, other: &MutableMmr<B2>) -> bool {
-        (self.get_merkle_root() == other.get_merkle_root())
+        self.get_merkle_root() == other.get_merkle_root()
     }
 }
 

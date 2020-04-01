@@ -11,6 +11,9 @@ pub trait Storage {
     /// Returns the number of hashes stored in the backend
     fn len(&self) -> Result<usize, Self::Error>;
 
+    /// Returns if empty
+    fn is_empty(&self) -> Result<bool, Self::Error>;
+
     /// Store a new item and return the index of the stored item
     fn push(&mut self, item: Self::Value) -> Result<usize, Self::Error>;
 
@@ -45,6 +48,10 @@ impl<T: Clone> Storage for Vec<T> {
 
     fn len(&self) -> Result<usize, Self::Error> {
         Ok(Vec::len(self))
+    }
+
+    fn is_empty(&self) -> Result<bool, Self::Error> {
+        Ok(Vec::is_empty(self))
     }
 
     fn push(&mut self, item: Self::Value) -> Result<usize, Self::Error> {

@@ -19,7 +19,7 @@ use std::cmp::{
 /// of the hash of that data to the leaf nodes in the MMR.
 #[derive(Debug)]
 pub struct MerkleMountainRange<B>
-where B: Storage
+    where B: Storage
 {
     pub(crate) hashes: B
 }
@@ -43,6 +43,7 @@ where
         for hash in leaf_hashes {
             self.push(&hash)?;
         }
+        
         Ok(())
     }
 
@@ -194,7 +195,7 @@ where
     /// Search for a given hash in the leaf node array. This is a very slow function, being O(n). In general, it's
     /// better to cache the index of the hash when storing it rather than using this function, but it's here for
     /// completeness. The index that is returned is the index of the _leaf node_, and not the MMR node index.
-    pub fn find_leaf_node(&self, hash: &H256) -> Result<Option<usize>, GeneError> {
+    pub fn find_node_index(&self, hash: &H256) -> Result<Option<usize>, GeneError> {
         for i in 0..self
             .hashes
             .len()
@@ -207,6 +208,18 @@ where
         Ok(None)
     }
 
+    /// Search for the leaf index of the given hash in the leaf nodes of the MMR.
+    pub fn find_leaf_index(&self, hash: &H256) -> Result<Option<usize>, GeneError> {
+        for index in 0..self.get_leaf_count()? {
+            if let Some(retrieved_hash) = self.get_leaf_hash(index)? {
+                if *hash == retrieved_hash {
+                    return Ok(Some(index));
+                }
+            }
+        }
+        Ok(None)
+    }    
+
     pub(crate) fn null_hash() -> H256 {
         H256::zero()
     }
@@ -216,6 +229,12 @@ where
             GeneError::BackendError(e.to_string())
         })
     }
+
+    pub fn clear(&mut self) -> Result<(), GeneError> {
+        self.hashes
+            .clear()
+            .map_err(|e| GeneError::BackendError(e.to_string()))
+    }
 }
 
 impl<B, B2> PartialEq<MerkleMountainRange<B2>> for MerkleMountainRange<B>
@@ -224,7 +243,7 @@ where
     B2: Storage<Value = H256>,
 {
     fn eq(&self, other: &MerkleMountainRange<B2>) -> bool {
-        (self.get_merkle_root() == other.get_merkle_root())
+        self.get_merkle_root() == other.get_merkle_root()
     }
 }
 

@@ -24,47 +24,40 @@ use anyhow::Result;
 /// Configuration for the MerkleChangeTracker.
 #[derive(Debug, Clone, Copy)]
 pub struct MerkleChangeTrackerConfig {
-    /// When the max_history_len is reached then the number of checkpoints upto the min_history_len is committed to the
-    /// base MMR.
-    pub min_history_len: usize,
-    /// The max_history_len specifies the point in history upto where the MMR can be rewinded.
-    pub max_history_len: usize,
+    /// The rewind_hist_len specifies the point in history upto where the MMR can be efficiently rewound before the
+    /// base mmr needs to be reconstructed.
+    pub rewind_hist_len: usize,
+}
+
+impl Default for MerkleChangeTrackerConfig {
+    fn default() -> Self {
+        Self { rewind_hist_len: 100 }
+    }
 }
 
 
-/// A struct that wraps an MMR to keep track of changes to the MMR over time. This enables one to roll
-/// back changes to a point in history. Think of `MerkleChangeTracker` as 'git' for MMRs.
-///
-/// [MutableMMr] implements [std::ops::Deref], so that once you've wrapped the MMR, all the immutable methods are
-/// available through the auto-dereferencing.
-///
-/// The basic philosophy of `MerkleChangeTracker` is as follows:
-/// * Start with a 'base' MMR. For efficiency, you usually want to make this a [pruned_mmr::PrunedMmr], but it
-/// doesn't have to be.
-/// * We then maintain a change-list for every append and delete that is made on the MMR.
-/// * You can `commit` the change-set at any time, which will create a new [MerkleCheckPoint] summarising the
-/// changes, and the current change-set is reset.
-/// * You can `rewind` to a previously committed checkpoint, p. This entails resetting the MMR to the base state and
-/// then replaying every checkpoint in sequence until checkpoint p is reached. `rewind_to_start` and `replay` perform
-/// similar functions.
-/// * You can `reset` the ChangeTracker, which clears the current change-set and moves you back to the most recent
-/// checkpoint ('HEAD')
+/// The MMR cache is used to calculate Merkle and Merklish roots based on the state of the set of shared checkpoints. It
+/// can efficiently create an updated cache state when small checkpoint rewinds were detected or the checkpoint state
+/// has been expanded.
 #[derive(Debug)]
 pub struct MerkleChangeTracker<BaseBackend, CpBackend>
 where
     BaseBackend: Storage<Value = H256>,
 {
-    base: MutableMmr<BaseBackend>,
-    mmr: PrunedMutableMmr,
-
+    // The last checkpoint index applied to the base MMR.
+    base_cp_index: usize,
+    // One more than the last checkpoint index applied to the current MMR.
+    curr_cp_index: usize,
+    // The base MMR is the anchor point of the mmr cache. A rewind can start at this state if the checkpoint tip is
+    // beyond the base checkpoint index. It will have to rebuild the base MMR if the checkpoint tip index is less
+    // than the base MMR index.
+    base_mmr: MutableMmr<BaseBackend>,
+    // The current mmr represents the latest mmr with all checkpoints applied.
+    pub curr_mmr: PrunedMutableMmr,
+    // Access to the checkpoint set.
     checkpoints: CpBackend,
-    // The hashes added since the last commit
-    current_additions: Vec<H256>,
-    // The deletions since the last commit
-    current_deletions: Bitmap,
-    config: MerkleChangeTrackerConfig,
-    // history transient length
-    hist_commit_count: usize,
+    // Configuration for the MMR cache.
+    config: MerkleChangeTrackerConfig
 }
 
 
@@ -73,229 +66,134 @@ where
     BaseBackend: Storage<Value = H256>,
     CpBackend: Storage<Value = MerkleCheckPoint> + StorageExt<Value = MerkleCheckPoint>,
 {
-    /// Wrap an MMR inside a change tracker.
-    ///
-    /// # Parameters
-    /// * `base`: The base, or anchor point of the change tracker. This represents the earliest point that you can
-    ///   [MerkleChangeTracker::rewind] to.
-    /// * `mmr`: An empty MMR instance that will be used to maintain the current state of the MMR.
-    /// * `diffs`: The (usually empty) collection of diffs that will be used to store the MMR checkpoints.
-    ///
-    /// # Returns
-    /// A new `MerkleChangeTracker` instance that is configured using the MMR and ChangeTracker instances provided.
+    /// Creates a new MMR cache with access to the provided set of shared checkpoints.
     pub fn new(
-        base: MutableMmr<BaseBackend>,
-        diffs: CpBackend,
+        base_mmr: BaseBackend,
+        checkpoints: CpBackend,
         config: MerkleChangeTrackerConfig,
     ) -> Result<MerkleChangeTracker<BaseBackend, CpBackend>, GeneError>
     {
-        if config.max_history_len < config.min_history_len {
-            return Err(GeneError::InvalidConfig);
-        }
-        let hist_commit_count = config.max_history_len - config.min_history_len + 1;
-
-        let mmr = prune_mutable_mmr::<_>(&base)?;
-        Ok(MerkleChangeTracker {
-            base,
-            mmr,
-            checkpoints: diffs,
-            current_additions: Vec::new(),
-            current_deletions: Bitmap::create(),
+        let base_mmr = MutableMmr::new(base_mmr);
+        let curr_mmr = prune_mutable_mmr::<_>(&base_mmr)?;
+        let mut mmr_cache = MerkleChangeTracker {
+            base_cp_index: 0,
+            curr_cp_index: 0,
+            base_mmr,
+            curr_mmr,
+            checkpoints,
             config,
-            hist_commit_count,
-        })
+        };
+        mmr_cache.reset()?;
+        Ok(mmr_cache)
     }
 
-    /// Reset the MerkleChangeTracker and restore the base MMR state.
-    pub fn restore(&mut self, base_state: MutableMmrLeafNodes) -> Result<(), GeneError> {
-        self.checkpoints
-            .clear()
-            .map_err(|e| GeneError::BackendError(e.to_string()))?;
-        self.rewind_to_start()?;
-        self.base.restore(base_state)
-    }
-
-    /// Return the number of Checkpoints this change tracker has recorded
-    pub fn checkpoint_count(&self) -> Result<usize, GeneError> {
-        self.checkpoints
+    // Calculate the base checkpoint index based on the rewind history length and the number of checkpoints.
+    fn calculate_base_cp_index(&mut self) -> Result<usize, GeneError> {
+        let cp_count = self
+            .checkpoints
             .len()
-            .map_err(|e| GeneError::BackendError(e.to_string()))
-    }
-
-    /// Push the given hash into the MMR and update the current change-set
-    pub fn push(&mut self, hash: &H256) -> Result<usize, GeneError> {
-        let result = self.mmr.push(hash)?;
-        self.current_additions.push(hash.clone());
-        Ok(result)
-    }
-
-    /// Discards the current change-set and resets the MMR state to that of the last checkpoint
-    pub fn reset(&mut self) -> Result<(), GeneError> {
-        self.replay(self.checkpoint_count()?)
-    }
-
-    /// Mark a node for deletion and optionally compress the deletion bitmap. See [MutableMmr::delete_and_compress]
-    /// for more details
-    pub fn delete_and_compress(&mut self, leaf_node_index: u32, compress: bool) -> bool {
-        let result = self.mmr.delete_and_compress(leaf_node_index, compress);
-
-        if result {
-            self.current_deletions.add(leaf_node_index)
+            .map_err(|e| GeneError::BackendError(e.to_string()))?;
+        if cp_count > self.config.rewind_hist_len {
+            return Ok(cp_count - self.config.rewind_hist_len);
         }
-        result
+        Ok(0)
     }
 
-    /// Mark a node for completion, and compress the roaring bitmap. See [delete_and_compress] for details.
-    pub fn delete(&mut self, leaf_node_index: u32) -> bool {
-        self.delete_and_compress(leaf_node_index, true)
+    // Reconstruct the base MMR using the shared checkpoints. The base MMR contains the state from the the first
+    // checkpoint to the checkpoint tip minus the minimum history length.
+    fn create_base_mmr(&mut self) -> Result<(), GeneError> {
+        self.base_mmr.clear()?;
+        self.base_cp_index = self.calculate_base_cp_index()?;
+        for cp_index in 0..=self.base_cp_index {
+            if let Some(cp) = self
+                .checkpoints
+                .get(cp_index)
+                .map_err(|e| GeneError::BackendError(e.to_string()))?
+            {
+                cp.apply(&mut self.base_mmr)?;
+            }
+        }
+        Ok(())
     }
 
-    /// Compress the roaring bitmap mapping deleted nodes. You never have to call this method unless you have been
-    /// calling [delete_and_compress] with `compress` set to `false` ahead of a call to [get_merkle_root].
-    pub fn compress(&mut self) -> bool {
-        self.mmr.compress()
+     // Reconstruct the current MMR from the next checkpoint after the base MMR to the last checkpoints.
+     fn create_curr_mmr(&mut self) -> Result<(), GeneError> {
+        self.curr_cp_index = self
+            .checkpoints
+            .len()
+            .map_err(|e| GeneError::BackendError(e.to_string()))?;
+        self.curr_mmr = prune_mutable_mmr::<_>(&self.base_mmr)?;
+        for cp_index in self.base_cp_index + 1..self.curr_cp_index {
+            if let Some(cp) = self
+                .checkpoints
+                .get(cp_index)
+                .map_err(|e| GeneError::BackendError(e.to_string()))?
+            {
+                cp.apply(&mut self.curr_mmr)?;
+            }
+        }
+        Ok(())
     }
 
-    /// Check if the the number of checkpoints have exceeded the maximum configured history length. If it does then the
-    /// oldest checkpoints are applied to the base mmr.
+    // An update to the checkpoints have been detected, update the base MMR to the correct position.
     fn update_base_mmr(&mut self) -> Result<(), GeneError> {
-        if self.checkpoint_count()? > self.config.max_history_len {
-            for cp_index in 0..self.hist_commit_count {
+        let prev_cp_index = self.base_cp_index;
+        self.base_cp_index = self.calculate_base_cp_index()?;
+        if prev_cp_index < self.base_cp_index {
+            for cp_index in prev_cp_index + 1..=self.base_cp_index {
                 if let Some(cp) = self
                     .checkpoints
                     .get(cp_index)
                     .map_err(|e| GeneError::BackendError(e.to_string()))?
                 {
-                    cp.apply(&mut self.base)?;
+                    cp.apply(&mut self.base_mmr)?;
                 }
             }
-            self.checkpoints.shift(self.hist_commit_count)?;
+        } else {
+            self.create_base_mmr()?;
         }
         Ok(())
     }
 
-
-    /// Commit the change history since the last commit to a new [MerkleCheckPoint] and clear the current change set.
-    pub fn commit(&mut self) -> Result<(), GeneError> {
-        let mut hash_set = Vec::new();
-        mem::swap(&mut hash_set, &mut self.current_additions);
-
-        let mut deleted_set = Bitmap::create();
-        mem::swap(&mut deleted_set, &mut self.current_deletions);
-
-        let diff = MerkleCheckPoint::new(hash_set, deleted_set);
-        self.checkpoints
-            .push(diff)
-            .map_err(|e| GeneError::BackendError(e.to_string()))?;
-
-        self.update_base_mmr()
-    }
-
-    /// Rewind the MMR state by the given number of Checkpoints.
-    ///
-    /// Example:
-    ///
-    /// Assuming we start with an empty Mutable MMR, and apply the following:
-    /// push(1), push(2), delete(1), *Checkpoint*  (1)
-    /// push(3), push(4)             *Checkpoint*  (2)
-    /// push(5), delete(4)           *Checkpoint*  (3)
-    /// push(6)
-    ///
-    /// The state is now:
-    /// ```text
-    /// 1 2 3 4 5 6
-    /// x     x
-    /// ```
-    ///
-    /// After calling `rewind(1)`, The push of 6 wasn't check-pointed, so it will be discarded, and rewinding back one
-    /// point to checkpoint 2 the state will be:
-    /// ```text
-    /// 1 2 3 4
-    /// x
-    /// ```
-    ///
-    /// Calling `rewind(1)` again will yield:
-    /// ```text
-    /// 1 2
-    /// x
-    /// ```
-    pub fn rewind(&mut self, steps_back: usize) -> Result<(), GeneError> {
-        self.replay(self.checkpoint_count()? - steps_back)
-    }
-
-    /// Rewinds the MMR back to the state of the base MMR; essentially discarding all the history accumulated to date.
-    pub fn rewind_to_start(&mut self) -> Result<(), GeneError> {
-        self.mmr = self.revert_mmr_to_base()?;
-        Ok(())
-    }
-
-    // Common function for rewind_to_start and replay
-    fn revert_mmr_to_base(&mut self) -> Result<PrunedMutableMmr, GeneError> {
-        let mmr = prune_mutable_mmr::<_>(&self.base)?;
-        self.current_deletions = Bitmap::create();
-        self.current_additions = Vec::new();
-
-        Ok(mmr)
-    }
-
-    /// Similar to [MerkleChangeTracker::rewind], `replay` moves the MMR state through checkpoints, but uses the base
-    /// MMR as the starting point and steps forward through `num_checkpoints` checkpoints, rather than rewinding from
-    /// the current state.
-    pub fn replay(&mut self, num_checkpoints: usize) -> Result<(), GeneError> {
-        let mut mmr = self.revert_mmr_to_base()?;
-        self.checkpoints.truncate(num_checkpoints)?;
-        let mut result = Ok(());
-
-        self.checkpoints.for_each(|v| {
-            if result.is_err() {
-                return;
-            }
-            result = match v {
-                Ok(cp) => cp.apply(&mut mmr),
-                Err(e) => Err(e),
-            };
-        })?;
-
-        mmr.compress();
-        self.mmr = mmr;
-
-        result
-    }
-
-    pub fn get_checkpoint(&self, index: usize) -> Result<MerkleCheckPoint, GeneError> {
-        match self
+     /// This function updates the state of the MMR cache based on the current state of the shared checkpoints.
+     pub fn update(&mut self) -> Result<(), GeneError> {
+        let cp_count = self
             .checkpoints
-            .get(index)
-            .map_err(|e| GeneError::BackendError(e.to_string()))?
-        {
-            None => Err(GeneError::OutOfRange),
-            Some(cp) => Ok(cp.clone()),
+            .len()
+            .map_err(|e| GeneError::BackendError(e.to_string()))?;
+        if cp_count < self.base_cp_index {
+            // Checkpoint before the base MMR index, this will require a full reconstruction of the cache.
+            self.create_base_mmr()?;
+            self.create_curr_mmr()?;
+        } else if cp_count < self.curr_cp_index {
+            // A short checkpoint reorg has occured, and requires the current MMR to be reconstructed.
+            self.create_curr_mmr()?;
+        } else if cp_count > self.curr_cp_index {
+            // The cache has fallen behind and needs to update to the new checkpoint state.
+            self.update_base_mmr()?;
+            self.create_curr_mmr()?;
         }
+        Ok(())
     }
 
-    /// Returns the MMR index of a newly added hash, this index is only valid if the change history is Committed.
-    pub fn index(&self, hash: &H256) -> Option<usize> {
-        self.current_additions
-            .iter()
-            .position(|h| h == hash)
-            .map(|i| self.mmr.len() as usize - self.current_additions.len() + i)
+    /// Reset the MmrCache and rebuild the base and current MMR state.
+    pub fn reset(&mut self) -> Result<(), GeneError> {
+        self.create_base_mmr()?;
+        self.create_curr_mmr()
     }
 
-    /// Returns the number of leave nodes in the base MMR.
-    pub fn get_base_leaf_count(&self) -> usize {
-        self.base.get_leaf_count()
+    /// Returns the hash of the leaf index provided, as well as its deletion status. The node has been marked for
+    /// deletion if the boolean value is true.
+    pub fn fetch_mmr_node(&self, leaf_index: u32) -> Result<(Option<H256>, bool), GeneError> {
+        let (base_hash, base_deleted) = self.base_mmr.get_leaf_status(leaf_index)?;
+        let (curr_hash, curr_deleted) = self.curr_mmr.get_leaf_status(leaf_index)?;
+        if let Some(base_hash) = base_hash {
+            return Ok((Some(base_hash), base_deleted | curr_deleted));
+        }
+        Ok((curr_hash, base_deleted | curr_deleted))
     }
 
 
-    /// Returns the MMR state of the base MMR.
-    pub fn to_base_leaf_nodes(
-        &self,
-        index: usize,
-        count: usize,
-    ) -> Result<MutableMmrLeafNodes, GeneError>
-    {
-        self.base.to_leaf_nodes(index, count)
-    }
 }
 
 impl<BaseBackend, DiffBackend> Deref for MerkleChangeTracker<BaseBackend, DiffBackend>
@@ -305,7 +203,7 @@ where
     type Target = PrunedMutableMmr;
 
     fn deref(&self) -> &Self::Target {
-        &self.mmr
+        &self.curr_mmr
     }
 }
 
@@ -336,6 +234,22 @@ impl MerkleCheckPoint {
 
         mmr.deleted.or_inplace(&self.nodes_deleted);
         Ok(())
+    }
+    
+    /// Resets the current MerkleCheckpoint.
+    pub fn clear(&mut self) {
+        self.nodes_added.clear();
+        self.nodes_deleted = Bitmap::create();
+    }
+
+    /// Add a hash to the set of nodes added.
+    pub fn push_addition(&mut self, hash: H256) {
+        self.nodes_added.push(hash);
+    }
+
+    /// Add a a deleted index to the set of deleted nodes.
+    pub fn push_deletion(&mut self, leaf_index: u32) {
+        self.nodes_deleted.add(leaf_index);
     }
 
     /// Return a reference to the hashes of the nodes added in the checkpoint
